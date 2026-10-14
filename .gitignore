@@ -1,0 +1,27 @@
+# Node dependencies
+node_modules/
+
+# Python cache and environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Logs and temporary files
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+
+# Ignore generated TTS audio
+tts/generated/
+
+# Ignore temporary reference profiles, but KEEP female_ref.wav
+tts/temp_profile.wav

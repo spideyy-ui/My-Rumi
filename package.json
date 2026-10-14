@@ -1,0 +1,14 @@
+{
+  "name": "rumi-electron-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Rumi transparent desktop companion test",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron ."
+  },
+  "dependencies": {
+    "electron": "^39.0.0",
+    "three": "^0.180.0"
+  }
+}
