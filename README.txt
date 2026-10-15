@@ -10,4 +10,8 @@ Run:
 
 The window is transparent and frameless.
 Rumi.glb is included at public/models/Rumi.glb.
-The first GLB animation is played once and held at the final pose.
+The Noesis character animation is permanently locked to frame 0.
+
+TTS Dependencies (Python 3.13):
+py -3.13 -m pip install supertonic==1.3.1 soundfile edge-tts
+Voice: Supertonic F2 (local in-memory waveform synthesis; Microsoft Edge TTS fallback)

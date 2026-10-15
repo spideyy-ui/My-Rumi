@@ -103,7 +103,7 @@ loader.load(
       0
     );
 
-    // Preserve the existing Noesis animation setup.
+    // Lock Noesis character animation permanently to frame 0.
     if (gltf.animations.length) {
       mixer = new THREE.AnimationMixer(model);
 
@@ -112,9 +112,9 @@ loader.load(
       action.setLoop(THREE.LoopOnce, 1);
       action.clampWhenFinished = true;
 
-      action.reset();
-      action.time = 0;
+      action.play();
       action.paused = true;
+      action.time = 0;
 
       mixer.update(0);
     }
@@ -151,12 +151,7 @@ loader.load(
 function animate() {
   requestAnimationFrame(animate);
 
-  const dt = clock.getDelta();
-
-  if (mixer) {
-    mixer.update(dt);
-  }
-
+  // Noesis animation is permanently locked to frame 0; do not advance mixer with dt.
   renderer.render(scene, camera);
 }
 
@@ -392,12 +387,11 @@ document.addEventListener('keydown', (event) => {
 });
 
 // ============================================================
-// CHATTERBOX AUDIO PLAYBACK
+// SUPERTONIC / TTS AUDIO PLAYBACK
 // ============================================================
 
-// Audio paths are only accepted from the main process through
-// the restricted preload bridge. The renderer receives a path,
-// not unrestricted filesystem access.
+// Audio payloads (in-memory data URLs or file paths) are accepted from
+// the main process through the restricted preload bridge.
 
 let currentAudio = null;
 let playbackGeneration = 0;
@@ -461,9 +455,9 @@ function stopCurrentAudio() {
   }
 }
 
-function playChatterboxAudio(audioPath) {
-  if (typeof audioPath !== 'string' || !audioPath.trim()) {
-    console.error('Received an invalid TTS audio path.');
+function playTTSAudio(audioSource) {
+  if (typeof audioSource !== 'string' || !audioSource.trim()) {
+    console.error('Received an invalid TTS audio source.');
 
     if (window.rumiDesktop) {
       window.rumiDesktop.ttsPlaybackError();
@@ -478,20 +472,24 @@ function playChatterboxAudio(audioPath) {
   const generation = playbackGeneration;
   playbackFinished = false;
 
-  // Electron's main process generated this WAV path.
-  // Convert the Windows path to a file URL safely.
-  const audioUrl = `file:///${audioPath
-    .replace(/\\/g, '/')
-    .split('/')
-    .map((part, index) => {
-      // Preserve the drive colon, e.g. C:
-      if (index === 0 && /^[A-Za-z]:$/.test(part)) {
-        return part;
-      }
+  // Support both in-memory data URIs (Supertonic) and filesystem paths (fallback)
+  let audioUrl;
+  if (audioSource.startsWith('data:') || audioSource.startsWith('blob:')) {
+    audioUrl = audioSource;
+  } else {
+    audioUrl = `file:///${audioSource
+      .replace(/\\/g, '/')
+      .split('/')
+      .map((part, index) => {
+        // Preserve the drive colon, e.g. C:
+        if (index === 0 && /^[A-Za-z]:$/.test(part)) {
+          return part;
+        }
 
-      return encodeURIComponent(part);
-    })
-    .join('/')}`;
+        return encodeURIComponent(part);
+      })
+      .join('/')}`;
+  }
 
   const audio = new Audio(audioUrl);
 
@@ -523,7 +521,7 @@ function playChatterboxAudio(audioPath) {
 
   audio.play().then(() => {
     if (generation === playbackGeneration) {
-      console.log('Rumi Chatterbox audio started.');
+      console.log('Rumi TTS audio started.');
     }
   }).catch((error) => {
     console.error('Unable to start Rumi audio:', error);
@@ -531,6 +529,9 @@ function playChatterboxAudio(audioPath) {
     finishPlaybackOnce(generation, true);
   });
 }
+
+// Preserve backward-compatible alias
+const playChatterboxAudio = playTTSAudio;
 
 // ============================================================
 // RUMI IPC EVENTS
@@ -565,16 +566,16 @@ if (window.rumiDesktop) {
   });
 
   // AI response: keep logging, while main.cjs requests
-  // Chatterbox generation separately.
+  // TTS generation separately.
   window.rumiDesktop.onAIResponse((response) => {
     console.log('Rumi says:', response);
   });
 
-  // Generated WAV ready.
-  window.rumiDesktop.onTTSAudio((audioPath) => {
-    console.log('Received Chatterbox audio:', audioPath);
+  // Generated audio ready.
+  window.rumiDesktop.onTTSAudio((audioSource) => {
+    console.log('Received TTS audio.');
 
-    playChatterboxAudio(audioPath);
+    playTTSAudio(audioSource);
   });
 
   // TTS generation failure.

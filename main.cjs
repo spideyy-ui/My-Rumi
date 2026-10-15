@@ -2,6 +2,8 @@ const { app, BrowserWindow, screen, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const path = require('path');
 
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
 // ============================================================
 // RUMI PROCESS MANAGEMENT
 // ============================================================
@@ -21,7 +23,8 @@ let shuttingDown = false;
 const CONVERSATION_TIMEOUT = 15000;
 
 const TTS_PYTHON =
-  'C:\\Users\\shubh\\Downloads\\Rumi-TTS-Test\\.venv\\Scripts\\python.exe';
+  process.env.RUMI_TTS_PYTHON ||
+  (process.platform === 'win32' ? 'py' : 'python3');
 
 const TTS_SCRIPT = path.join(
   __dirname,
@@ -127,7 +130,7 @@ function exitConversationMode() {
 
 
 // ============================================================
-// START CHATTERBOX TTS SERVICE
+// START SUPERTONIC TTS SERVICE (WITH EDGE TTS FALLBACK)
 // ============================================================
 
 function startTTS() {
@@ -135,17 +138,18 @@ function startTTS() {
     return;
   }
 
-  console.log('Starting Rumi Chatterbox TTS service...');
+  console.log('Starting Rumi Supertonic TTS service...');
 
-  console.log('Python:', TTS_PYTHON);
+  const spawnArgs = TTS_PYTHON === 'py'
+    ? ['-3.13', '-u', TTS_SCRIPT]
+    : ['-u', TTS_SCRIPT];
+
+  console.log('Python:', TTS_PYTHON, spawnArgs.join(' '));
   console.log('TTS script:', TTS_SCRIPT);
 
   ttsProcess = spawn(
     TTS_PYTHON,
-    [
-      '-u',
-      TTS_SCRIPT
-    ],
+    spawnArgs,
     {
       cwd: path.join(__dirname, 'tts'),
 
@@ -177,21 +181,27 @@ function startTTS() {
         continue;
       }
 
-      // Only this exact protocol line is treated as an audio path.
-      if (line.startsWith('OUTPUT:')) {
-        const audioPath = line.slice('OUTPUT:'.length).trim();
+      // Audio output protocol lines: in-memory data URL or filesystem path
+      if (line.startsWith('OUTPUT:') || line.startsWith('AUDIO_DATA:')) {
+        const audioPayload = line.startsWith('OUTPUT:')
+          ? line.slice('OUTPUT:'.length).trim()
+          : line.slice('AUDIO_DATA:'.length).trim();
 
-        if (audioPath) {
-          console.log('Chatterbox audio generated:', audioPath);
+        if (audioPayload) {
+          if (audioPayload.startsWith('data:')) {
+            console.log('Supertonic audio generated (in-memory waveform).');
+          } else {
+            console.log('TTS audio generated (file):', audioPayload);
+          }
 
-          sendToRenderer('rumi:tts-audio', audioPath);
+          sendToRenderer('rumi:tts-audio', audioPayload);
         }
 
         continue;
       }
 
       if (line === 'TTS ERROR:') {
-        console.error('Chatterbox failed to generate audio.');
+        console.error('Supertonic TTS failed to generate audio.');
 
         sendToRenderer('rumi:tts-error');
 
@@ -211,7 +221,7 @@ function startTTS() {
   });
 
   currentProcess.on('error', (error) => {
-    console.error('Failed to start Chatterbox TTS:', error);
+    console.error('Failed to start Supertonic TTS:', error);
 
     if (ttsProcess === currentProcess) {
       ttsProcess = null;
@@ -221,7 +231,7 @@ function startTTS() {
   });
 
   currentProcess.on('close', (code) => {
-    console.log('Chatterbox TTS process closed:', code);
+    console.log('Supertonic TTS process closed:', code);
 
     if (ttsProcess === currentProcess) {
       ttsProcess = null;
@@ -235,7 +245,7 @@ function startTTS() {
 
 
 // ============================================================
-// SEND TEXT TO CHATTERBOX
+// SEND TEXT TO SUPERTONIC TTS
 // ============================================================
 
 function speakWithTTS(text) {
@@ -253,14 +263,14 @@ function speakWithTTS(text) {
     ttsProcess.stdin.destroyed ||
     !ttsProcess.stdin.writable
   ) {
-    console.error('Chatterbox TTS service is not available.');
+    console.error('Supertonic TTS service is not available.');
 
     sendToRenderer('rumi:tts-error');
 
     return;
   }
 
-  console.log('Sending response to Chatterbox.');
+  console.log('Sending response to Supertonic TTS.');
   console.log(`[TIMING] TTS_SENT ${Date.now()}`);
   try {
     // The service accepts one text request per line.
@@ -343,7 +353,7 @@ Rumi:`,
     // and any other existing UI listeners.
     sendToRenderer('rumi:ai-response', reply);
 
-    // Generate speech using the persistent Chatterbox process.
+    // Generate speech using the persistent Supertonic process.
     speakWithTTS(reply);
 
   } catch (error) {
@@ -906,7 +916,7 @@ function cleanup() {
 
   stopProcess(oldSTT, 'STT');
   stopProcess(oldWake, 'wake detector');
-  stopProcess(oldTTS, 'Chatterbox TTS');
+  stopProcess(oldTTS, 'Supertonic TTS');
 }
 
 

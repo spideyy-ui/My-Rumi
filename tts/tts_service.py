@@ -1,167 +1,233 @@
 import sys
 import os
 import uuid
+import time
+import re
+import io
+import base64
+import asyncio
 import traceback
 
-import torch
 import numpy as np
-import torchaudio
-import time
-
-# Set torch to use all CPU cores for inference
-torch.set_num_threads(max(1, os.cpu_count() or 1))
-
-from chatterbox.tts_turbo import ChatterboxTurboTTS
-import chatterbox.models.t3.t3 as t3_module
-import chatterbox.models.s3gen.flow_matching as fm_module
-
+import soundfile as sf
 
 # ============================================================
-# RUMI TTS SERVICE
-# Chatterbox - persistent model
+# RUMI TTS SERVICE - SUPERTONIC F2 (LOCAL) WITH EDGE TTS FALLBACK
 # ============================================================
 
-# Suppress tqdm progress bar output to stderr (which flooded Electron console with fake [TTS ERROR] 0/1000 lines)
-t3_module.tqdm = lambda it, *a, **k: it
-fm_module.tqdm = lambda it, *a, **k: it
+VOICE_NAME = "F2"
+FALLBACK_EDGE_VOICE = "en-US-MichelleNeural"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-REFERENCE_AUDIO = os.path.join(BASE_DIR, "female_ref.wav")
 OUTPUT_DIR = os.path.join(BASE_DIR, "generated")
-
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-print("Loading Chatterbox...", flush=True)
+# Preserve fallback ability: If Chatterbox engine is explicitly requested,
+# route directly to the preserved Chatterbox implementation.
+if os.environ.get("RUMI_TTS_ENGINE", "").strip().lower() == "chatterbox":
+    chatterbox_script = os.path.join(BASE_DIR, "chatterbox_tts_service.py")
+    if os.path.exists(chatterbox_script):
+        print("Routing to preserved Chatterbox TTS service...", flush=True)
+        import runpy
+        runpy.run_path(chatterbox_script, run_name="__main__")
+        sys.exit(0)
 
-# Load model ONCE
-model = ChatterboxTurboTTS.from_pretrained(
-    device="cpu",
-    nano=True
-)
+# Optional Edge TTS import for fallback
+try:
+    import edge_tts
+    edge_tts_available = True
+except ImportError:
+    edge_tts_available = False
 
-# ------------------------------------------------------------
-# Compatibility patches used during our successful test
-# ------------------------------------------------------------
-
-old_log_mel = model.s3gen.tokenizer.log_mel_spectrogram
-
-model.s3gen.tokenizer.log_mel_spectrogram = (
-    lambda audio, padding=0:
-    old_log_mel(audio.float(), padding).float()
-)
-
-old_embeds_from_mels = model.ve.embeds_from_mels
-
-model.ve.embeds_from_mels = (
-    lambda mels, *args, **kwargs:
-    old_embeds_from_mels(
-        [np.asarray(x, dtype=np.float32) for x in mels],
-        *args,
-        **kwargs
+# Import Supertonic TTS
+try:
+    from supertonic import TTS
+    supertonic_available = True
+except ImportError:
+    print(
+        "ERROR: 'supertonic' package is not installed in this Python environment.",
+        file=sys.stderr,
+        flush=True
     )
-    if isinstance(mels, list)
-    else old_embeds_from_mels(
-        mels.float(),
-        *args,
-        **kwargs
-    )
-)
+    supertonic_available = False
 
-# ------------------------------------------------------------
-# Latency & safety patch: Dynamic max_gen_len for T3
-# In the original library, generate() omits max_gen_len, causing
-# inference_turbo to default to 1000 steps (40s of audio).
-# If the model misses the EOS token, it iterates up to 1000/1000
-# taking ~1.5-2 minutes on CPU. We calculate a safe bound based
-# on text token count (S3 is 25 tokens/s; ~8-10 speech tokens/word).
-# ------------------------------------------------------------
-orig_inference_turbo = model.t3.inference_turbo
+# ============================================================
+# MODEL INITIALIZATION (LOADED ONCE AT STARTUP)
+# ============================================================
 
-def optimized_inference_turbo(*args, **kwargs):
-    if "max_gen_len" not in kwargs or kwargs["max_gen_len"] is None or kwargs["max_gen_len"] == 1000:
-        text_tokens = kwargs.get("text_tokens")
-        if text_tokens is None and len(args) > 1:
-            text_tokens = args[1]
-        if text_tokens is not None:
-            n_tokens = text_tokens.shape[-1]
-            kwargs["max_gen_len"] = min(500, max(120, int(n_tokens * 12) + 50))
-        else:
-            kwargs["max_gen_len"] = 350
-    return orig_inference_turbo(*args, **kwargs)
+supertonic_tts = None
+voice_style = None
+sample_rate = 44100
+supertonic_ready = False
+synthesis_count = 0
 
-model.t3.inference_turbo = optimized_inference_turbo
+if supertonic_available and os.environ.get("RUMI_FORCE_EDGE_TTS") != "1":
+    try:
+        print(f"Loading Supertonic TTS (Voice: {VOICE_NAME})...", flush=True)
+        supertonic_tts = TTS(
+            auto_download=True,
+            intra_op_num_threads=2,
+            inter_op_num_threads=1
+        )
+        sample_rate = supertonic_tts.sample_rate
+        voice_style = supertonic_tts.get_voice_style(VOICE_NAME)
+        supertonic_ready = True
+        print(f"Supertonic TTS ready. Voice: {VOICE_NAME}, Sample Rate: {sample_rate} Hz.", flush=True)
+    except Exception as init_err:
+        print(f"[TTS WARNING] Failed to initialize Supertonic TTS: {init_err}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+        supertonic_ready = False
 
-# ------------------------------------------------------------
-# Latency optimization: Pre-compute reference conditionals ONCE
-# Passing audio_prompt_path on every generate() call caused Chatterbox
-# to re-read female_ref.wav, re-resample audio, and re-compute speaker
-# embeddings on CPU (costing 20-40s per request). Pre-computing it
-# once at startup preserves the exact same voice and eliminates this delay.
-# ------------------------------------------------------------
-print("Preparing female voice conditionals...", flush=True)
-model.prepare_conditionals(REFERENCE_AUDIO)
+if not supertonic_ready:
+    print("[TTS NOTICE] Supertonic is unavailable. Running in Edge TTS fallback mode.", flush=True)
 
-print("Chatterbox loaded.", flush=True)
 print("Rumi TTS service ready.", flush=True)
 
 
-def generate_voice(text):
-    text = text.strip()
-
+def clean_speech_text(text: str) -> str:
+    """
+    Clean markdown symbols, action tags, and superfluous whitespace
+    so speech sounds natural.
+    """
     if not text:
-        return None
+        return ""
 
-    filename = f"rumi_{uuid.uuid4().hex}.wav"
+    # Remove code blocks or inline backticks
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+
+    # Remove bold / italic markdown asterisks or underscores
+    text = re.sub(r'[*_]{1,3}([^*_]+)[*_]{1,3}', r'\1', text)
+
+    # Remove standalone asterisks or special decorative characters
+    text = re.sub(r'[*_#~>]', '', text)
+
+    # Collapse multiple whitespace characters into a single space
+    text = re.sub(r'\s+', ' ', text).strip()
+
+    return text
+
+
+def synthesize_supertonic_in_memory(clean_text: str) -> str:
+    """
+    Synthesize speech using local Supertonic F2 and encode waveform
+    into an in-memory WAV data URI without touching disk.
+    """
+    global synthesis_count
+    synthesis_count += 1
+
+    gen_start = time.time()
+    wav, duration = supertonic_tts.synthesize(
+        text=clean_text,
+        voice_style=voice_style,
+        lang="en",
+        total_steps=8,
+        speed=1.0
+    )
+    gen_end = time.time()
+
+    dur_val = float(duration.squeeze())
+
+    # Encode in-memory WAV
+    bio = io.BytesIO()
+    sf.write(bio, wav.squeeze(), sample_rate, format="WAV")
+    wav_bytes = bio.getvalue()
+    b64_data = base64.b64encode(wav_bytes).decode("ascii")
+    data_uri = f"data:audio/wav;base64,{b64_data}"
+
+    print(f"GENERATION_TIME:{gen_end - gen_start:.3f}s", flush=True)
+    print(f"AUDIO_DURATION:{dur_val:.2f}s", flush=True)
+    print(f"OUTPUT:{data_uri}", flush=True)
+    return data_uri
+
+
+async def synthesize_edge_tts_file(text: str, output_path: str):
+    """
+    Generate speech using Microsoft Edge TTS fallback.
+    """
+    communicate = edge_tts.Communicate(text, FALLBACK_EDGE_VOICE)
+    await communicate.save(output_path)
+
+
+def synthesize_edge_fallback(clean_text: str) -> str:
+    """
+    Fallback synthesis using Microsoft Edge TTS saved to a temporary MP3 file.
+    """
+    if not edge_tts_available:
+        raise RuntimeError("edge_tts package is not installed for fallback.")
+
+    print(f"[TTS Fallback] Synthesizing via Edge TTS: {clean_text}", flush=True)
+    filename = f"rumi_fallback_{uuid.uuid4().hex}.mp3"
     output_path = os.path.join(OUTPUT_DIR, filename)
 
-    print(f"TTS: {text}", flush=True)
+    gen_start = time.time()
+    asyncio.run(synthesize_edge_tts_file(clean_text, output_path))
+    gen_end = time.time()
 
+    if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(f"Edge TTS fallback did not produce a valid file: {output_path}")
+
+    print(f"GENERATION_TIME:{gen_end - gen_start:.3f}s", flush=True)
+    print(f"OUTPUT:{output_path}", flush=True)
+    return output_path
+
+
+def generate_voice(text: str):
+    """
+    Synthesize speech for a given text prompt.
+    Tries Supertonic F2 (in-memory) first, then falls back to Edge TTS if needed.
+    """
+    clean_text = clean_speech_text(text)
+
+    if not clean_text:
+        return None
+
+    print(f"TTS: {clean_text}", flush=True)
+
+    # 1. Primary: Supertonic F2
+    if supertonic_ready and os.environ.get("RUMI_FORCE_EDGE_TTS") != "1":
+        try:
+            return synthesize_supertonic_in_memory(clean_text)
+        except Exception as supertonic_err:
+            print(f"[TTS WARNING] Supertonic synthesis failed: {supertonic_err}. Falling back to Edge TTS...", file=sys.stderr, flush=True)
+            traceback.print_exc(file=sys.stderr)
+
+    # 2. Fallback: Edge TTS
     try:
-        # Record start time for generation
-        gen_start = time.time()
-        with torch.inference_mode():
-            wav = model.generate(text)
-        gen_end = time.time()
-        # Record start time for saving
-        save_start = time.time()
-        torchaudio.save(
-            output_path,
-            wav,
-            model.sr
-        )
-        save_end = time.time()
-        # Log timings
-        print(f"GENERATION_TIME:{gen_end - gen_start:.3f}s", flush=True)
-        print(f"SAVE_TIME:{save_end - save_start:.3f}s", flush=True)
-        print(f"OUTPUT:{output_path}", flush=True)
-        return output_path
-
-    except Exception:
+        return synthesize_edge_fallback(clean_text)
+    except Exception as fallback_err:
         print("TTS ERROR:", flush=True)
-        traceback.print_exc()
+        print(f"[TTS Fallback Error] {fallback_err}", file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
         return None
 
 
 # ============================================================
-# Read text continuously from Electron / terminal
+# Protocol loop: Read text continuously from stdin
 # One line = one TTS request
 # ============================================================
 
-for line in sys.stdin:
-    try:
-        text = line.strip()
+def main():
+    for line in sys.stdin:
+        try:
+            raw_text = line.strip()
 
-        if not text:
-            continue
+            if not raw_text:
+                continue
 
-        if text == "__QUIT__":
-            print("Stopping Rumi TTS service.", flush=True)
+            if raw_text == "__QUIT__":
+                print("Stopping Rumi TTS service.", flush=True)
+                break
+
+            generate_voice(raw_text)
+
+        except KeyboardInterrupt:
             break
 
-        generate_voice(text)
+        except Exception:
+            print("TTS ERROR:", flush=True)
+            traceback.print_exc(file=sys.stderr)
 
-    except KeyboardInterrupt:
-        break
 
-    except Exception:
-        traceback.print_exc()
+if __name__ == "__main__":
+    main()
